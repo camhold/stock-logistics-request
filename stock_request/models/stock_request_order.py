@@ -13,7 +13,6 @@ class StockRequestOrder(models.Model):
     _inherit = ["mail.thread", "mail.activity.mixin"]
     _order = "id desc"
 
-    # Métodos de creación por defecto
     @api.model
     def default_get(self, fields):
         res = super().default_get(fields)
@@ -27,9 +26,10 @@ class StockRequestOrder(models.Model):
             res["location_id"] = warehouse.lot_stock_id.id
         return res
 
-    # Métodos relacionados con los estados de la orden
     def __get_request_order_states(self):
-        return self.env["stock.request"].fields_get(allfields=["state"])["state"]["selection"]
+        return self.env["stock.request"].fields_get(allfields=["state"])["state"][
+            "selection"
+        ]
 
     def _get_request_order_states(self):
         return self.__get_request_order_states()
@@ -152,63 +152,40 @@ class StockRequestOrder(models.Model):
     @api.depends("warehouse_id", "location_id", "stock_request_ids")
     def _compute_route_ids(self):
         route_obj = self.env["stock.route"]
-        routes = route_obj.search([('supplied_wh_id', '=', self.warehouse_id.id)])
-
         for record in self:
-            # Asignar las rutas a 'route_ids'
-            record.route_ids = [(6, 0, routes.ids)]
-
-            # Si se encontraron rutas, asignamos la primera a route_id
-            # if routes:
-            #     record.route_id = routes[0]
-            # else:
-            #     record.route_id = False
-
-            # Log para depuración
-            _logger.info(f"Se asignaron las rutas: {routes.ids} para el almacén: {record.warehouse_id.name}")
-
-    @api.onchange('warehouse_id')
-    def onchange_warehouse_id(self):
-        for record in self:
-            # Verificar si hay un almacén seleccionado
-            if not record.warehouse_id:
-                # Limpiamos las rutas y la ubicación cuando no hay almacén seleccionado
-                record.route_ids = False
-                record.route_id = False
-                record.location_id = False  # Limpiar la ubicación
+            routes = route_obj.search([("supplied_wh_id", "=", record.warehouse_id.id)])
+            routes_by_warehouse = {}
+            for route in routes:
+                for warehouse in route.warehouse_ids:
+                    routes_by_warehouse.setdefault(warehouse.id, self.env["stock.route"])
+                    routes_by_warehouse[warehouse.id] |= route
+            parents = record.get_parents().ids
+            valid_routes = []
+            for route in routes:
+                if any(p.location_dest_id.id in parents for p in route.rule_ids):
+                    valid_routes.append(route)
+            filtered_routes = self.env["stock.route"].browse(
+                [route.id for route in valid_routes]
+            )
+            if record.stock_request_ids:
+                all_routes = record.stock_request_ids.mapped("route_ids")
+                common_routes = all_routes
                 for line in record.stock_request_ids:
-                    line.route_id = False
-                return
-
-            # Filtrar las rutas en base al warehouse_id
-            route_obj = self.env['stock.route']
-            routes = route_obj.search([('supplied_wh_id', '=', record.warehouse_id.id)])
-
-            #Asignar las rutas a la cabecera
-            record.route_ids = [(6, 0, routes.ids)]
-
-            # Limpiar la ruta de la cabecera antes de asignar nuevas rutas
-            record.route_id = False  # Limpiamos el campo de la ruta en la cabecera antes de asignar nuevas rutas
-
-            # Sincronizar las rutas de las líneas
-            for line in record.stock_request_ids:
-                # Limpiar la ruta en cada línea antes de asignar la nueva
-                line.route_id = False
-                # Asignamos la primera ruta de las encontradas a las líneas
-                # line.write({'route_id': routes[0] if routes else False})
-
-            # Buscar y asignar la ubicación de tránsito
-            location = self.env['stock.location'].search([
-                ('usage', '=', 'transit'),
-                ('location_id', '=', record.warehouse_id.view_location_id.id),  # Filtro por la ubicación padre
-            ], limit=1)
-            if location:
-                record.location_id = location.id  # Asignar la ubicación de tránsito encontrada
-
+                    common_routes &= line.route_ids
+                final_routes = filtered_routes | common_routes
+                record.route_ids = [(6, 0, final_routes.ids)]
+            else:
+                record.route_ids = [(6, 0, filtered_routes.ids)]
             # Log para depuración
-            _logger.info(f"Se asignaron las rutas: {routes.ids} para el almacén: {record.warehouse_id.name}")
-            _logger.info(f"Se asignó la ubicación de tránsito: {record.location_id.name}")
+            _logger.info(f"Rutas asignadas: {record.route_ids.ids} para almacén: {record.warehouse_id.name}")
 
+    def get_parents(self):
+        location = self.location_id
+        result = location
+        while location.location_id:
+            location = location.location_id
+            result |= location
+        return result
 
     @api.depends("stock_request_ids")
     def _compute_route_id(self):
@@ -279,6 +256,21 @@ class StockRequestOrder(models.Model):
             if loc_wh and self.warehouse_id != loc_wh:
                 self.warehouse_id = loc_wh
                 self.with_context(no_change_childs=True).onchange_warehouse_id()
+        self.change_childs()
+
+    @api.onchange("procurement_group_id")
+    def onchange_procurement_group_id(self):
+        self.change_childs()
+
+    @api.onchange("company_id")
+    def onchange_company_id(self):
+        if self.company_id and (
+            not self.warehouse_id or self.warehouse_id.company_id != self.company_id
+        ):
+            self.warehouse_id = self.env["stock.warehouse"].search(
+                [("company_id", "=", self.company_id.id)], limit=1
+            )
+            self.with_context(no_change_childs=True).onchange_warehouse_id()
         self.change_childs()
 
     def change_childs(self):
@@ -354,5 +346,115 @@ class StockRequestOrder(models.Model):
             raise UserError(_("Only orders on draft state can be unlinked"))
         return super().unlink()
 
+    @api.constrains("warehouse_id", "company_id")
+    def _check_warehouse_company(self):
+        if any(
+            request.warehouse_id.company_id != request.company_id for request in self
+        ):
+            raise ValidationError(
+                _(
+                    "The company of the stock request must match with "
+                    "that of the warehouse."
+                )
+            )
+
+    @api.constrains("location_id", "company_id")
+    def _check_location_company(self):
+        if any(
+            request.location_id.company_id
+            and request.location_id.company_id != request.company_id
+            for request in self
+        ):
+            raise ValidationError(
+                _(
+                    "The company of the stock request must match with "
+                    "that of the location."
+                )
+            )
+
+    @api.model
+    def _create_from_product_multiselect(self, products):
+        if not products:
+            return False
+        if products._name not in ("product.product", "product.template"):
+            raise ValidationError(
+                _("This action only works in the context of products")
+            )
+        if products._name == "product.template":
+            # search instead of mapped so we don't include archived variants
+            products = self.env["product.product"].search(
+                [("product_tmpl_id", "in", products.ids)]
+            )
+        expected = self.default_get(["expected_date"])["expected_date"]
+        order = self.env["stock.request.order"].create(
+            dict(
+                expected_date=expected,
+                stock_request_ids=[
+                    (
+                        0,
+                        0,
+                        dict(
+                            product_id=product.id,
+                            product_uom_id=product.uom_id.id,
+                            product_uom_qty=1.0,
+                            expected_date=expected,
+                        ),
+                    )
+                    for product in products
+                ],
+            )
+        )
+        action = self.env["ir.actions.act_window"]._for_xml_id(
+            "stock_request.stock_request_order_action"
+        )
+        action["views"] = [
+            (self.env.ref("stock_request.stock_request_order_form").id, "form")
+        ]
+        action["res_id"] = order.id
+        return action
+
+
     def action_print_stock_request(self):
         return (self.env.ref('stock_request.action_stock_request_order_report').report_action(self))
+
+    @api.onchange('warehouse_id')
+    def onchange_warehouse_id(self):
+        for record in self:
+            # Verificar si hay un almacén seleccionado
+            if not record.warehouse_id:
+                # Limpiamos las rutas y la ubicación cuando no hay almacén seleccionado
+                record.route_ids = False
+                record.route_id = False
+                record.location_id = False  # Limpiar la ubicación
+                for line in record.stock_request_ids:
+                    line.route_id = False
+                return
+
+            # Filtrar las rutas en base al warehouse_id
+            route_obj = self.env['stock.route']
+            routes = route_obj.search([('supplied_wh_id', '=', record.warehouse_id.id)])
+
+            #Asignar las rutas a la cabecera
+            record.route_ids = [(6, 0, routes.ids)]
+
+            # Limpiar la ruta de la cabecera antes de asignar nuevas rutas
+            record.route_id = False  # Limpiamos el campo de la ruta en la cabecera antes de asignar nuevas rutas
+
+            # Sincronizar las rutas de las líneas
+            for line in record.stock_request_ids:
+                # Limpiar la ruta en cada línea antes de asignar la nueva
+                line.route_id = False
+                # Asignamos la primera ruta de las encontradas a las líneas
+                # line.write({'route_id': routes[0] if routes else False})
+
+            # Buscar y asignar la ubicación de tránsito
+            location = self.env['stock.location'].search([
+                ('usage', '=', 'transit'),
+                ('location_id', '=', record.warehouse_id.view_location_id.id),  # Filtro por la ubicación padre
+            ], limit=1)
+            if location:
+                record.location_id = location.id  # Asignar la ubicación de tránsito encontrada
+
+            # Log para depuración
+            _logger.info(f"Se asignaron las rutas: {routes.ids} para el almacén: {record.warehouse_id.name}")
+            _logger.info(f"Se asignó la ubicación de tránsito: {record.location_id.name}")
